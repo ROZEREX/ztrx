@@ -153,9 +153,39 @@ fn card_fills() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FILLS").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_INDIRECT_WINDOW`: `2`: windows on, ended only
+/// by the title's barriers ([`State::end_window`]) and by what uses the
+/// scratch buffer; `1`: windows on, also ended by every dispatch and direct
+/// draw (as first written); unset or `0` (default): off, a clamp pass per
+/// record.
+///
+/// A dispatch or draw cannot change arguments a later indirect call reads
+/// without a barrier between them (on the console too: the command
+/// processor reads the arguments when it gets to the call), so the window
+/// clamped after the last barrier still holds what the title wrote. Ending
+/// it at every dispatch left the world's frame with ~6,400 clamps, each a
+/// pass between two waits for every earlier shader write: ~20 us each on
+/// the card (timing runs of 2026-11-25), most of the indirect draws' time.
+fn window_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    // Off by default: run "p3-clean" (2026-11-25) with 2 had the card's wait
+    // at 505 ms a frame against 205 without: the title does change
+    // arguments between barriers this layer sees, so a window held across
+    // its dispatches draws records it has since rewritten.
+    *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_WINDOW").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
 fn windows() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    window_mode() > 0
+}
+
+/// Whether a dispatch or direct draw ends the window ([`window_mode`] 1).
+fn work_ends_window() -> bool {
+    window_mode() == 1
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -221,6 +251,13 @@ impl Drop for State {
 }
 
 impl State {
+    /// The title barred its later work behind its earlier shader writes:
+    /// arguments a window holds clamped may have been written since, so the
+    /// next indirect call clamps afresh ([`window_mode`]).
+    pub(crate) fn end_window(&mut self) {
+        self.window = None;
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -1677,8 +1714,11 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        // It may write the arguments a window holds clamped.
-        self.window = None;
+        // It may write the arguments a window holds clamped: seen after the
+        // title's next barrier, which ends the window ([`window_mode`]).
+        if work_ends_window() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1811,7 +1851,9 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        if work_ends_window() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2155,7 +2197,9 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        if work_ends_window() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2260,7 +2304,9 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        if work_ends_window() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage

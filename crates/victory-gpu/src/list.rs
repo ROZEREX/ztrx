@@ -744,6 +744,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        // What indirect calls after it read may have been written before it.
+        if count > 0 {
+            with_state(this, |_, state| state.end_window());
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -1944,6 +1948,10 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
+    }
+    #[cfg(windows)]
+    if count > 0 {
+        with_state(this, |_, state| state.end_window());
     }
     #[cfg(windows)]
     if count > 0

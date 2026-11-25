@@ -1548,6 +1548,33 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// with the copy's CPU side byte by byte and put into title memory through
 /// the kernel. A piece is its own bytes of its copy and of title memory,
 /// so eight threads take an eighth of them each.
+/// Whether what shaders wrote to copies in the card's memory is fetched
+/// and merged into title memory (`VICTORY_CARD_BACK=0`: not; an
+/// experiment, to learn whether anything reads it back).
+fn card_back_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BACK").is_none_or(|v| v != "0"))
+}
+
+/// Title buffers (by their start address) whose copies in the card's
+/// memory keep what shaders wrote there, unfetched
+/// (`VICTORY_CARD_BACK_SKIP=0xd6b610000,0xfb2600000`): buffers only the
+/// card reads again, through the same copy. A run with nothing fetched
+/// (`VICTORY_CARD_BACK=0`) went from 2.0 to 3.0 fps but drew garbage on
+/// clothes, so some of what is fetched is read elsewhere; this names the
+/// buffers that are not.
+fn card_back_skipped(shadow: &crate::shadow::Shadow) -> bool {
+    static SKIP: OnceLock<Vec<u64>> = OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_BACK_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    });
+    !skip.is_empty() && skip.contains(&shadow.span().0)
+}
+
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
@@ -3411,6 +3438,12 @@ impl Host {
                 }
             }
         }
+        // Experiment (`VICTORY_CARD_BACK=0`): what shaders wrote to copies in
+        // the card's memory stays there.
+        if !card_back_on() {
+            pieces.clear();
+        }
+        pieces.retain(|(shadow, ..)| !card_back_skipped(shadow));
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next fetch.
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -3643,6 +3676,10 @@ impl Host {
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
+        if !card_back_on() {
+            pieces.clear();
+        }
+        pieces.retain(|&(i, ..)| !card_back_skipped(&plan.ranges[i].shadow));
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
