@@ -188,6 +188,18 @@ fn work_ends_window() -> bool {
     window_mode() == 1
 }
 
+/// A small buffer bound as the launcher stage's argument buffer for direct
+/// mesh dispatches, which pass their count as a constant and read nothing.
+fn launch_unused_args() -> Option<&'static ID3D12Resource> {
+    struct Held(ID3D12Resource);
+    // SAFETY: D3D12 resources are free-threaded.
+    unsafe impl Send for Held {}
+    // SAFETY: as above.
+    unsafe impl Sync for Held {}
+    static BUFFER: std::sync::OnceLock<Option<Held>> = std::sync::OnceLock::new();
+    BUFFER.get_or_init(|| crate::host::host()?.uav_buffer(64 << 10).map(Held)).as_ref().map(|h| &h.0)
+}
+
 /// Whether indirect calls read arguments the title's CPU wrote in place,
 /// unclamped (`VICTORY_DIRECT_ARGS=1`). Every call clamped its record in a
 /// compute pass of its own: on the card the switch from drawing to compute
@@ -1867,6 +1879,19 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        // A pipeline with our launcher stage: the count goes to it.
+        if let Some(launch) = crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.launch) {
+            let ran = mesh_test() != 1
+                && mesh_kept(self.pipeline)
+                && self.prepare_for(list, false, true)
+                && launch_unused_args().is_some_and(|unused| self.launch(list, launch, [0, x, 0, 0], unused));
+            if !ran {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(self.pipeline);
+            }
+            return;
+        }
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -1888,6 +1913,28 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// A mesh call of a pipeline with our launcher stage: its constants
+    /// (record offset, direct group count, whether to read the record) and
+    /// argument buffer, then one launcher group.
+    fn launch(&mut self, list: &HostList, (constants, buffer): (u32, u32), values: [u32; 4], args: &ID3D12Resource) -> bool {
+        let Ok(l6) = list.list.cast::<ID3D12GraphicsCommandList6>() else {
+            return false;
+        };
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("launched mesh {values:?}"), false));
+        self.mesh_scissor(list, true);
+        // SAFETY: an open list with the pipeline and its roots set; the
+        // argument buffer is a live copy held by the list.
+        unsafe {
+            list.list.SetGraphicsRoot32BitConstants(constants, 4, values.as_ptr().cast(), 0);
+            list.list.SetGraphicsRootShaderResourceView(buffer, args.GetGPUVirtualAddress());
+            l6.DispatchMesh(1, 1, 1);
+        }
+        self.mesh_scissor(list, false);
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -2416,6 +2463,26 @@ impl State {
             why("arguments outside title buffers");
             return false;
         };
+        // One record, no count, a pipeline with our launcher stage: the
+        // launcher reads and bounds the record itself
+        // (`crate::pipeline::host::mesh_launcher`).
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && let Some(launch) = p.launch
+        {
+            let offset = args.offset(arguments);
+            if offset <= u64::from(u32::MAX - 12) && offset % 4 == 0 {
+                self.window = None;
+                args.refresh(list, arguments, len);
+                if !self.prepare_for(list, false, true) {
+                    why("prepare failed");
+                    return false;
+                }
+                crate::indirect::before_launch(&list.list);
+                return self.launch(list, launch, [offset as u32, 0, 1, 0], &args.buffer);
+            }
+        }
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),

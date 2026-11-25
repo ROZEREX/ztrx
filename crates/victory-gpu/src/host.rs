@@ -2419,7 +2419,56 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// What the thread that lands flights fetches card copies' pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
+/// Whether the relay fetches what shaders wrote to copies in the card's
+/// memory on a copy queue of its own (`VICTORY_COPY_FETCH=1`).
+///
+/// The fetch went to the one direct queue, behind every flight sent since
+/// the flights it is for: the thread that lands them waited 86-94 ms a
+/// frame for fetches of a few milliseconds of copying (runs of
+/// 2026-11-25). The flights it lands have run already, so a copy queue
+/// runs it at once. What it may then not assume is that the card has the
+/// title bytes of every send put on the direct queue so far: it takes the
+/// sends the card has really run ([`send_fence`]) as the merge's limit,
+/// so a byte of a later send is never taken for a shader's write.
+fn copy_fetch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_COPY_FETCH").is_some_and(|v| v == "1"))
+}
+
+/// Signalled on the direct queue with each send's number behind it
+/// (`Host::card_before`): its completed value is the last send the card
+/// has run.
+fn send_fence(device: &ID3D12Device) -> Option<&'static ID3D12Fence> {
+    static FENCE: OnceLock<Option<ID3D12Fence>> = OnceLock::new();
+    FENCE
+        // SAFETY: a plain fence of our own.
+        .get_or_init(|| unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.ok())
+        .as_ref()
+}
+
+/// A copy queue with a list of its own, for [`copy_fetch`].
+struct CopyLane {
+    queue: ID3D12CommandQueue,
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+}
+
+fn make_copy_lane(device: &ID3D12Device) -> Option<CopyLane> {
+    // SAFETY: plain objects of our own; the list is closed until used.
+    unsafe {
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
+            .ok()?;
+        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
+        let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
+        list.Close().ok()?;
+        Some(CopyLane { queue, allocator, list })
+    }
+}
+
 struct RelayFetch {
+    /// With [`copy_fetch`]: the copy queue and its list.
+    lane: Option<CopyLane>,
     list: Prelude,
     fence: ID3D12Fence,
     event: HANDLE,
@@ -3278,6 +3327,14 @@ impl Host {
             }
             used.push((false, sync));
         }
+        // The card has received sends up to `sent_as` once this signal is
+        // reached ([`copy_fetch`]).
+        if sent_as > 0
+            && let Some(fence) = send_fence(&self.device)
+        {
+            // SAFETY: our fence, on our queue, behind the send.
+            let _ = unsafe { self.queue.Signal(fence, sent_as) };
+        }
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
@@ -3407,6 +3464,7 @@ impl Host {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
+                lane: if copy_fetch() { make_copy_lane(&self.device) } else { None },
                 list,
                 fence,
                 event,
@@ -3493,8 +3551,41 @@ impl Host {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
         f.sent += 1;
-        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let waiting = std::time::Instant::now();
+        // On a copy queue of its own (`copy_fetch`): runs at once; the
+        // merge's limit is the last send the card has run.
+        if let Some(lane) = &f.lane
+            && let Some(sends) = send_fence(&self.device)
+        {
+            let (fence, event, sent) = (f.fence.clone(), f.event, f.sent);
+            // SAFETY: the lane's last run was waited for by this thread;
+            // live buffers (the copies are held by the plans; buffers may be
+            // used on several queues at once); our fence and event.
+            let ran = unsafe {
+                (|| -> windows::core::Result<u64> {
+                    // Read before the copy runs: sends up to it are on the card.
+                    let after = sends.GetCompletedValue();
+                    lane.allocator.Reset()?;
+                    lane.list.Reset(&lane.allocator, None)?;
+                    for (shadow, lo, hi, at) in &pieces {
+                        lane.list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    lane.list.Close()?;
+                    lane.queue.ExecuteCommandLists(&[Some(lane.list.cast::<ID3D12CommandList>()?)]);
+                    lane.queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    Ok(after)
+                })()
+            };
+            let after = match ran {
+                Ok(after) => after,
+                Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched on the copy queue ({e})")),
+            };
+            self.relay_fetch_merge(&pieces, data, total, after, waiting);
+            return;
+        }
+        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -3524,6 +3615,20 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
+        self.relay_fetch_merge(&pieces, data, total, after, waiting);
+    }
+
+    /// [`Host::relay_card_back`] once the fetch has run: the stats, and
+    /// what shaders wrote goes into title memory with `after` as the last
+    /// send the card had when it ran.
+    fn relay_fetch_merge(
+        &self,
+        pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)],
+        data: usize,
+        total: u64,
+        after: u64,
+        waiting: std::time::Instant,
+    ) {
         let us = waiting.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
@@ -3535,7 +3640,7 @@ impl Host {
         }
         let mut title = Vec::new();
         let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
+        for (shadow, lo, hi, at) in pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };

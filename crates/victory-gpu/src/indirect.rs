@@ -479,6 +479,37 @@ pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
 /// the timing runs of 2026-11-25. The earlier writes the clamp reads are
 /// compute passes and copies (the title's argument passes; a write by
 /// another stage is behind the title's own barrier, which stays).
+/// Before a launched mesh call reads its record (`crate::pipeline::host::
+/// mesh_launcher`): earlier compute and copy writes are seen by the
+/// launcher stage. With enhanced barriers only compute and copies are
+/// waited for, and with no pass of ours between draws there are none
+/// outstanding after the first: the wait costs next to nothing. Else a
+/// UAV barrier on every resource, as the clamp had.
+pub(crate) fn before_launch(list: &ID3D12GraphicsCommandList) {
+    use windows::core::Interface;
+    if narrow_waits()
+        && let Ok(l7) = list.cast::<ID3D12GraphicsCommandList7>()
+    {
+        let barrier = [D3D12_GLOBAL_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING | D3D12_BARRIER_SYNC_COPY,
+            SyncAfter: D3D12_BARRIER_SYNC_VERTEX_SHADING,
+            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST,
+            AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+        }];
+        // SAFETY: an open list.
+        unsafe {
+            l7.Barrier(&[D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_GLOBAL,
+                NumBarriers: 1,
+                Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: barrier.as_ptr() },
+            }]);
+        }
+        return;
+    }
+    // SAFETY: an open list.
+    unsafe { list.ResourceBarrier(&[uav_barrier()]) };
+}
+
 fn narrow_waits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
