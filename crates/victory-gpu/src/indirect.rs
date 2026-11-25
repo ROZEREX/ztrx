@@ -487,7 +487,13 @@ pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
 /// UAV barrier on every resource, as the clamp had.
 pub(crate) fn before_launch(list: &ID3D12GraphicsCommandList) {
     use windows::core::Interface;
-    if narrow_waits()
+    // (`VICTORY_LAUNCH_FULL=1`: a UAV barrier on every resource, earlier
+    // draws' writes included: to learn whether a launched record is
+    // written by another stage than compute)
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let full = *FULL.get_or_init(|| std::env::var_os("VICTORY_LAUNCH_FULL").is_some_and(|v| v == "1"));
+    if !full
+        && narrow_waits()
         && let Ok(l7) = list.cast::<ID3D12GraphicsCommandList7>()
     {
         let barrier = [D3D12_GLOBAL_BARRIER {

@@ -65,6 +65,8 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
+                    // the mesh shaders' payload (`victory_shader::emit::mesh_payload`)
+                    "VICTORY_MESH_LAUNCH",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

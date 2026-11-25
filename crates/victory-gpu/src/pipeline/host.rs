@@ -305,7 +305,8 @@ pub(crate) struct HostPipeline {
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
     /// A mesh pipeline with our launcher stage ([`mesh_launcher`]): the
-    /// root parameters of its constants and of its argument buffer.
+    /// root parameters of its constants and of its argument buffer (the
+    /// count buffer's is the one after).
     pub(crate) launch: Option<(u32, u32)>,
     /// Its depth, stencil, cull and blend state in short, for the frame
     /// listing (empty for compute).
@@ -499,21 +500,24 @@ impl HostPipeline {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: LAUNCH_SPACE, Num32BitValues: 4 },
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: LAUNCH_SPACE, Num32BitValues: 8 },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_AMPLIFICATION,
             });
-            params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
-                Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                        ShaderRegister: 0,
-                        RegisterSpace: LAUNCH_SPACE,
-                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            // The argument buffer (t0) and the count buffer (t1).
+            for register in 0..2 {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: register,
+                            RegisterSpace: LAUNCH_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
                     },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_AMPLIFICATION,
-            });
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_AMPLIFICATION,
+                });
+            }
             (constants, constants + 1)
         });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
@@ -580,12 +584,22 @@ impl HostPipeline {
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
             // looked up again.
-            let name = super::library::name(
-                if launcher.is_some() { "mesh triangles launched" } else { "mesh triangles" },
-                &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
-            );
+            // (the launcher's own code in the name: a stored pipeline made
+            // with another version of it is not loaded)
+            let name = match launcher {
+                Some(amp) => super::library::name(
+                    "mesh triangles launched",
+                    &root_blob,
+                    &[amp, &code_bytes(&code(0)), &code_bytes(&code(1))],
+                    &state,
+                ),
+                None => super::library::name(
+                    "mesh triangles",
+                    &root_blob,
+                    &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                    &state,
+                ),
+            };
             let amp = launcher.map_or(D3D12_SHADER_BYTECODE::default(), |code| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: code.as_ptr().cast(),
                 BytecodeLength: code.len(),
@@ -840,37 +854,60 @@ const LAUNCH_SPACE: u32 = 90;
 pub(crate) fn mesh_launcher() -> Option<&'static [u8]> {
     const SOURCE: &str = r#"
 struct Payload { uint unused; };
-cbuffer Launch : register(b0, space90) { uint args_offset; uint direct_x; uint use_args; uint pad; };
+// mode 0: a direct dispatch of `direct_x` groups; 1: one record at
+// `args_offset`; 2: records `stride` apart, as many as the count buffer
+// says, at most `most`; 3: `most` records. One launcher group a record.
+cbuffer Launch : register(b0, space90) {
+    uint args_offset; uint direct_x; uint mode; uint stride; uint count_offset; uint most; uint pad0; uint pad1;
+};
 ByteAddressBuffer args : register(t0, space90);
+ByteAddressBuffer count_buf : register(t1, space90);
 groupshared Payload payload;
-static const uint GROUPS = 1u << 20;
 [numthreads(1, 1, 1)]
-void main() {
-    uint3 g = use_args != 0 ? args.Load3(args_offset) : uint3(direct_x, 1, 1);
-    g = min(g, uint3(65535u, 65535u, 65535u));
-    if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-        g = uint3(0, 0, 0);
+void main(uint3 group : SV_GroupID) {
+    uint3 g = uint3(direct_x, 1, 1);
+    if (mode == 1) {
+        g = args.Load3(args_offset);
+    } else if (mode >= 2) {
+        uint n = mode == 2 ? min(most, count_buf.Load(count_offset)) : most;
+        g = group.x < n ? args.Load3(args_offset + group.x * stride) : uint3(0, 0, 0);
     }
+    // As the argument clamp bounds a mesh record: the console's mesh
+    // dispatches are one-dimensional, and the record's other two words
+    // are not counts (taken whole, a large one emptied the draw).
+    g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
     DispatchMesh(g.x, g.y, g.z, payload);
 }
 "#;
     static CODE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     CODE.get_or_init(|| {
-        if std::env::var_os("VICTORY_MESH_LAUNCH").is_none_or(|v| v != "1") {
+        let asked = std::env::var_os("VICTORY_MESH_LAUNCH");
+        if asked.as_ref().is_none_or(|v| v != "1") {
+            tracing::info!(?asked, "mesh launcher stage off (VICTORY_MESH_LAUNCH)");
             return None;
         }
         // The SDK's dxc.exe beside the validator the translator uses.
-        let dxc = victory_shader::emit::validator::Validator::default_path()?.with_file_name("dxc.exe");
+        let Some(dxc) = victory_shader::emit::validator::Validator::default_path().map(|p| p.with_file_name("dxc.exe")) else {
+            tracing::warn!("mesh launcher stage: no Windows SDK dxc.exe found");
+            return None;
+        };
         let dir = std::env::temp_dir().join(format!("victory-launch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok()?;
         let (hlsl, out) = (dir.join("launch.hlsl"), dir.join("launch.dxil"));
-        std::fs::write(&hlsl, SOURCE).ok()?;
-        let ok = std::process::Command::new(&dxc)
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&hlsl, SOURCE)) {
+            tracing::warn!(error = %e, "mesh launcher stage: no room for its source");
+            return None;
+        }
+        let ran = std::process::Command::new(&dxc)
             .args(["-nologo", "-T", "as_6_5", "-E", "main", "-Fo"])
             .arg(&out)
             .arg(&hlsl)
-            .status()
-            .is_ok_and(|s| s.success());
+            .output();
+        if let Ok(o) = &ran
+            && !o.status.success()
+        {
+            tracing::warn!(stderr = %String::from_utf8_lossy(&o.stderr), "mesh launcher stage: dxc failed");
+        }
+        let ok = ran.is_ok_and(|o| o.status.success());
         let code = ok.then(|| std::fs::read(&out).ok()).flatten();
         let _ = std::fs::remove_dir_all(&dir);
         tracing::info!(made = code.is_some(), dxc = %dxc.display(), "mesh launcher stage (VICTORY_MESH_LAUNCH)");

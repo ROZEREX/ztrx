@@ -1884,7 +1884,7 @@ impl State {
             let ran = mesh_test() != 1
                 && mesh_kept(self.pipeline)
                 && self.prepare_for(list, false, true)
-                && launch_unused_args().is_some_and(|unused| self.launch(list, launch, [0, x, 0, 0], unused));
+                && launch_unused_args().is_some_and(|unused| self.launch(list, launch, [0, x, 0, 0, 0, 0, 0, 0], unused, unused, 1));
             if !ran {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
@@ -1916,9 +1916,18 @@ impl State {
     }
 
     /// A mesh call of a pipeline with our launcher stage: its constants
-    /// (record offset, direct group count, whether to read the record) and
-    /// argument buffer, then one launcher group.
-    fn launch(&mut self, list: &HostList, (constants, buffer): (u32, u32), values: [u32; 4], args: &ID3D12Resource) -> bool {
+    /// (record offset, direct group count, mode, stride, count offset, most
+    /// records), argument and count buffers, then `groups` launcher groups.
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &mut self,
+        list: &HostList,
+        (constants, buffer): (u32, u32),
+        values: [u32; 8],
+        args: &ID3D12Resource,
+        count: &ID3D12Resource,
+        groups: u32,
+    ) -> bool {
         let Ok(l6) = list.list.cast::<ID3D12GraphicsCommandList6>() else {
             return false;
         };
@@ -1928,9 +1937,10 @@ impl State {
         // SAFETY: an open list with the pipeline and its roots set; the
         // argument buffer is a live copy held by the list.
         unsafe {
-            list.list.SetGraphicsRoot32BitConstants(constants, 4, values.as_ptr().cast(), 0);
+            list.list.SetGraphicsRoot32BitConstants(constants, 8, values.as_ptr().cast(), 0);
             list.list.SetGraphicsRootShaderResourceView(buffer, args.GetGPUVirtualAddress());
-            l6.DispatchMesh(1, 1, 1);
+            list.list.SetGraphicsRootShaderResourceView(buffer + 1, count.GetGPUVirtualAddress());
+            l6.DispatchMesh(groups.max(1), 1, 1);
         }
         self.mesh_scissor(list, false);
         DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -2466,22 +2476,51 @@ impl State {
         // One record, no count, a pipeline with our launcher stage: the
         // launcher reads and bounds the record itself
         // (`crate::pipeline::host::mesh_launcher`).
+        // Every indirect mesh call of a pipeline with our launcher stage
+        // goes to it: one launcher group a record (more records, a count
+        // buffer: each group reads its own, and none past the count). The
+        // pipeline has the stage whatever the call, so no call of it may
+        // take the clamp's way.
         if kind == MESH
-            && max == 1
-            && count.is_none()
             && let Some(launch) = p.launch
         {
             let offset = args.offset(arguments);
-            if offset <= u64::from(u32::MAX - 12) && offset % 4 == 0 {
-                self.window = None;
-                args.refresh(list, arguments, len);
-                if !self.prepare_for(list, false, true) {
-                    why("prepare failed");
-                    return false;
-                }
-                crate::indirect::before_launch(&list.list);
-                return self.launch(list, launch, [offset as u32, 0, 1, 0], &args.buffer);
+            let fits = offset % 4 == 0 && offset + len <= u64::from(u32::MAX) && max <= 65535;
+            if !fits {
+                why("launched mesh call with arguments past what the launcher reaches");
+                return false;
             }
+            let counter = match count {
+                Some(at) => match crate::shadow::find_any(at, 4) {
+                    Some(s) => Some((s, at)),
+                    None => {
+                        why("count outside title buffers");
+                        return false;
+                    }
+                },
+                None => None,
+            };
+            self.window = None;
+            args.refresh(list, arguments, len);
+            let (count_buffer, count_offset) = match &counter {
+                Some((s, at)) => {
+                    s.refresh(list, *at, 4);
+                    (s.buffer.clone(), s.offset(*at) as u32)
+                }
+                None => (args.buffer.clone(), 0),
+            };
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            crate::indirect::before_launch(&list.list);
+            let mode = match (max, counter.is_some()) {
+                (1, false) => 1,
+                (_, true) => 2,
+                (_, false) => 3,
+            };
+            let values = [offset as u32, 0, mode, stride, count_offset, max, 0, 0];
+            return self.launch(list, launch, values, &args.buffer, &count_buffer, if mode == 1 { 1 } else { max });
         }
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {

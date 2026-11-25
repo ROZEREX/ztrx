@@ -159,6 +159,16 @@ pub fn loop_limit() -> u32 {
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
+/// The payload bytes a translated mesh shader declares: 4 with the host's
+/// launcher stage ahead of it (`VICTORY_MESH_LAUNCH=1`, an amplification
+/// shader that passes the smallest payload there is), else 0. D3D12
+/// refuses a pipeline whose mesh shader takes less payload than its
+/// amplification stage sends.
+pub fn mesh_payload() -> u32 {
+    static BYTES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| if std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| v == "1") { 4 } else { 0 })
+}
+
 pub fn group_sync() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
