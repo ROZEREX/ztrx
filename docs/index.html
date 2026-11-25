@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ROZEREX ztrx — progress log</title>
+<meta name="description" content="Progress log of the ROZEREX fork of ztrx: running the Xbox Series build of the game on a Windows PC with an NVIDIA card, measured frame by frame.">
+<style>
+:root{
+  --bg:#0d0f14; --panel:#151922; --panel2:#1b2130; --line:#262d3d;
+  --text:#e8ebf2; --muted:#9aa3b5; --accent:#4fd1c5; --accent2:#f6ad55; --bad:#fc8181; --good:#68d391;
+  --radius:14px;
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg:#f6f7fb; --panel:#ffffff; --panel2:#eef1f7; --line:#dde2ec; --text:#141823; --muted:#5b6478; --accent:#0f9d8f; --accent2:#c2711b; --bad:#c53030; --good:#2f855a; }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+a{color:var(--accent)}
+.wrap{max-width:1040px;margin:0 auto;padding:0 16px}
+header{padding:56px 0 24px;border-bottom:1px solid var(--line)}
+.tag{display:inline-block;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:3px 10px;margin:0 6px 6px 0}
+h1{font-size:clamp(30px,5vw,46px);line-height:1.1;margin:14px 0 10px}
+h2{font-size:24px;margin:48px 0 14px}
+h3{font-size:18px;margin:0 0 6px}
+.lead{color:var(--muted);max-width:720px;font-size:18px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin:28px 0 0}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px}
+.stat b{display:block;font-size:34px;line-height:1.1}
+.stat span{color:var(--muted);font-size:14px}
+.goal b{color:var(--accent2)}
+.now b{color:var(--accent)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:22px}
+.bars{display:flex;flex-direction:column;gap:12px}
+.bar{display:grid;grid-template-columns:minmax(140px,240px) 1fr 70px;gap:12px;align-items:center}
+.bar .t{font-size:14px;color:var(--muted)}
+.bar .track{background:var(--panel2);border-radius:999px;height:14px;position:relative;overflow:hidden}
+.bar .fill{position:absolute;inset:0 auto 0 0;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:999px}
+.bar .v{font-variant-numeric:tabular-nums;text-align:right;font-weight:600}
+.goalline{font-size:13px;color:var(--muted);margin-top:10px}
+.log{display:flex;flex-direction:column;gap:14px}
+.entry{display:grid;grid-template-columns:120px 1fr;gap:16px}
+.entry time{color:var(--muted);font-size:14px;padding-top:2px}
+.entry p{margin:4px 0 0;color:var(--muted)}
+.pill{font-size:12px;border-radius:999px;padding:2px 8px;margin-left:6px;vertical-align:2px;border:1px solid currentColor}
+.pill.up{color:var(--good)}
+.pill.fix{color:var(--accent2)}
+.pill.no{color:var(--bad)}
+.shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+figure img{display:block;width:100%;height:auto}
+figcaption{padding:10px 14px;font-size:14px;color:var(--muted)}
+.ba{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:720px){.ba{grid-template-columns:1fr}.entry{grid-template-columns:1fr;gap:2px}.bar{grid-template-columns:1fr 60px}.bar .t{grid-column:1/-1}}
+code{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:1px 6px;font-size:14px}
+pre{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:14px;overflow:auto;font-size:14px}
+table{width:100%;border-collapse:collapse;font-size:15px}
+td,th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600}
+ul.next li{margin:6px 0}
+footer{margin:64px 0 40px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);font-size:14px}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <span class="tag">Compatibility layer</span><span class="tag">Xbox Series build → Windows</span><span class="tag">NVIDIA</span><span class="tag">open source · GPL-3.0</span>
+    <h1>ROZEREX ztrx — progress log</h1>
+    <p class="lead">We run the Xbox Series build of the game natively on a Windows PC, and we write down every change with its measured frame rate. This fork keeps the <a href="https://github.com/ROZEREX/ztrx">ztrx</a> code alive and pushes its renderer from 2 fps toward playable.</p>
+    <div class="stats">
+      <div class="stat now"><b>8.5–9.5 fps</b><span>prison yard, median–max, full image</span></div>
+      <div class="stat"><b>~2.2 fps</b><span>where this fork started (same scene, clean image)</span></div>
+      <div class="stat goal"><b>30 fps</b><span>our goal</span></div>
+      <div class="stat"><b>RTX 3090</b><span>i7-14700K · 64 GB · Windows 11</span></div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <h2>Frame rate, step by step</h2>
+  <div class="card">
+    <div class="bars">
+      <div class="bar"><span class="t">Clean image, lockstep (start)</span><div class="track"><div class="fill" style="width:7.3%"></div></div><span class="v">2.2</span></div>
+      <div class="bar"><span class="t">+ narrow waits (enhanced barriers)</span><div class="track"><div class="fill" style="width:13.3%"></div></div><span class="v">4.0</span></div>
+      <div class="bar"><span class="t">+ copy-queue fetch</span><div class="track"><div class="fill" style="width:17.7%"></div></div><span class="v">5.3</span></div>
+      <div class="bar"><span class="t">+ mesh launcher (GPU-side argument bounds)</span><div class="track"><div class="fill" style="width:28.3%"></div></div><span class="v">8.5</span></div>
+    </div>
+    <p class="goalline">Bars are median fps over a 90-second steady window in the prologue's prison yard; full width = 30 fps.</p>
+  </div>
+
+  <h2>Screenshots (2026-11-25, 8–10 fps)</h2>
+  <div class="shots">
+    <figure><img src="img/yard-window.jpg" alt="The player character looks out of the cell window at the prison yard" loading="lazy"><figcaption>Cell window over the yard: walls, posters and light all drawn.</figcaption></figure>
+    <figure><img src="img/cell.jpg" alt="Two inmates at a table inside the cell" loading="lazy"><figcaption>Inside the cell.</figcaption></figure>
+    <figure><img src="img/dorm.jpg" alt="Dormitory with bunk beds and a door" loading="lazy"><figcaption>The dormitory, walking out.</figcaption></figure>
+  </div>
+
+  <h2>Log</h2>
+  <div class="log">
+    <div class="card entry"><time>2026-11-25</time><div><h3>Mesh launcher: 5.3 → 8.5 fps <span class="pill up">+60%</span></h3>
+      <p>Every indirect mesh draw (~5,000 a frame) ran a compute pass of its own to bound its arguments, and the card switched from drawing to compute and back each time (~18 µs a call). We put a tiny amplification shader of ours in front of every translated mesh shader: it reads the title's record on the GPU, bounds it, and launches the mesh groups itself. GPU wait per frame fell from ~130 ms to ~20 ms. The CPU is now the bottleneck.</p></div></div>
+    <div class="card entry"><time>2026-11-25</time><div><h3>The missing walls <span class="pill fix">fixed</span></h3>
+      <p>With the launcher on, the cell's walls vanished. Not a barrier, not the arguments: we fed it records from the old path and they were still missing. The console's mesh shaders write up to 40 KiB of outputs, more than the 32 KiB D3D12 allows. The card draws them alone, but behind an amplification stage it drew nothing of the large ones. Bisecting by output size (16 / 24 / 28 / 32 KiB) put the cut between 24 and 28 KiB, so shaders over 24 KiB keep the old path (185 of ~960 pipelines).</p></div></div>
+    <div class="card entry"><time>2026-11-25</time><div><h3>Copy-queue fetch: 4.0 → 5.3 fps <span class="pill up">+33%</span></h3>
+      <p>Memory the GPU wrote that the CPU must read was fetched behind newly submitted work. It now goes through a copy queue of its own, bounded by a fence that marks the last submission the card ran. Fetch waits: 94 → 7 ms.</p></div></div>
+    <div class="card entry"><time>2026-11-25</time><div><h3>Narrow waits: 2.2 → 4.0 fps <span class="pill up">+80%</span></h3>
+      <p>The argument clamp waited on the whole GPU (a UAV barrier on every resource) twice per indirect call. With enhanced barriers it now waits for compute and copies only. GPU time 190 → 134 ms; the image is the same.</p></div></div>
+    <div class="card entry"><time>2026-11-25</time><div><h3>Tried and dropped <span class="pill no">reverted</span></h3>
+      <p>Barrier-bounded argument windows (GPU time went up 2.5×: the title rewrites arguments between barriers); skipping card copy-backs by address (addresses change per run, textures broke); leaving copy-backs off (garbage on clothes). Each was measured, kept opt-in or removed.</p></div></div>
+  </div>
+
+  <h2>Before / after: the wall bug</h2>
+  <div class="ba">
+    <figure><img src="img/walls-missing.jpg" alt="Cell window with the walls around it missing; sky visible" loading="lazy"><figcaption>Launcher on every mesh shader: the walls around the window are gone and the sky shows through.</figcaption></figure>
+    <figure><img src="img/walls-back.jpg" alt="Cell window with the walls and posters drawn" loading="lazy"><figcaption>Launcher only up to 24 KiB of output: walls and posters are back.</figcaption></figure>
+  </div>
+
+  <h2>Where the frame goes now</h2>
+  <div class="card">
+    <table>
+      <tr><th>Part (per frame, ~118 ms)</th><th>Time</th><th>What it is</th></tr>
+      <tr><td>CPU preparation</td><td>~85 ms</td><td>translating the title's command lists; ~45 ms of it is copying title memory to the card</td></tr>
+      <tr><td>Copy-back</td><td>~40 ms</td><td>landing GPU-written memory back in the title's memory</td></tr>
+      <tr><td>GPU wait</td><td>~20–26 ms</td><td>the card itself is no longer the limit</td></tr>
+    </table>
+    <p class="goalline">30 fps means a 33 ms frame. Next: cut the copies (keep title memory resident on the card and copy only what changed) and overlap the copy-back with the next frame.</p>
+  </div>
+
+  <h2>Try it</h2>
+  <p>You need your own copy of the game; this project ships no game files. Build the branch <code>rozerex-fps</code> and set these switches before <code>scripts\play.ps1</code>:</p>
+<pre>$env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
+$env:VICTORY_CARD_BUFFERS_MB = "4096"
+$env:VICTORY_RELAY = "2"
+$env:VICTORY_WIDE_MERGE = "1"
+$env:VICTORY_WIDE_BACK = "1"
+$env:VICTORY_NARROW_WAITS = "1"
+$env:VICTORY_COPY_FETCH = "1"
+$env:VICTORY_MESH_LAUNCH = "1"</pre>
+  <p>The first run after a new build translates every shader again and can draw some walls late; judge the image from the second run. Known problems: blocky artifacts in places, some textures arrive late, and the game's ray-traced lighting does not run yet.</p>
+
+  <h2>Next</h2>
+  <ul class="next">
+    <li>Card-resident title memory: stop copying the same buffers every frame (the 45 ms).</li>
+    <li>Copy-back overlapped with the next frame instead of in its path (the 40 ms).</li>
+    <li>Spread command-list translation over cores.</li>
+  </ul>
+
+  <footer>
+    Code: <a href="https://github.com/ROZEREX/ztrx">github.com/ROZEREX/ztrx</a> (branch <code>rozerex-fps</code>), GPL-3.0, a fork of ztrx by Zettrox, whose repository is no longer online.
+    This project contains no game files or assets and is not affiliated with or endorsed by the game's developer or publisher. Screenshots are from our own test runs.
+  </footer>
+</main>
+</body>
+</html>
