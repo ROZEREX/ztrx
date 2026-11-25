@@ -494,7 +494,13 @@ impl HostPipeline {
         }
         // A mesh pipeline gets our launcher stage ahead of its mesh shader
         // (`mesh_launcher`): its constants and argument buffer.
-        let launcher = if mesh.is_some() { mesh_launcher() } else { None };
+        // Not ahead of a mesh shader whose outputs pass what D3D12 allows
+        // (it takes no payload: `victory_shader::emit::mesh_payload_for`).
+        let takes_payload = stages
+            .first()
+            .and_then(|(s, _)| s.translated())
+            .is_some_and(|t| victory_shader::emit::takes_payload(&t.host.dxil));
+        let launcher = if mesh.is_some() && takes_payload { mesh_launcher() } else { None };
         let launch = launcher.map(|_| {
             let constants = params.len() as u32;
             params.push(D3D12_ROOT_PARAMETER1 {
@@ -851,70 +857,25 @@ const LAUNCH_SPACE: u32 = 90;
 /// switch from drawing to compute and back for every call (which cost
 /// ~18 us a call, ~5,000 calls a frame, even with narrow waits). A direct
 /// mesh dispatch passes its group count as a constant.
+///
+/// Its code is built ahead of time from `launch.hlsl` with the Windows
+/// SDK's dxc (`dxc -T as_6_5 -E main -Fo launch.dxil launch.hlsl`, signed
+/// by it) and kept in the executable: compiled at run time, it needed the
+/// SDK and a folder of the user's to write in, and when that folder was
+/// refused the stage was silently off (2026-11-25).
 pub(crate) fn mesh_launcher() -> Option<&'static [u8]> {
-    const SOURCE: &str = r#"
-struct Payload { uint unused; };
-// mode 0: a direct dispatch of `direct_x` groups; 1: one record at
-// `args_offset`; 2: records `stride` apart, as many as the count buffer
-// says, at most `most`; 3: `most` records. One launcher group a record.
-cbuffer Launch : register(b0, space90) {
-    uint args_offset; uint direct_x; uint mode; uint stride; uint count_offset; uint most; uint pad0; uint pad1;
-};
-ByteAddressBuffer args : register(t0, space90);
-ByteAddressBuffer count_buf : register(t1, space90);
-groupshared Payload payload;
-[numthreads(1, 1, 1)]
-void main(uint3 group : SV_GroupID) {
-    uint3 g = uint3(direct_x, 1, 1);
-    if (mode == 1) {
-        g = args.Load3(args_offset);
-    } else if (mode >= 2) {
-        uint n = mode == 2 ? min(most, count_buf.Load(count_offset)) : most;
-        g = group.x < n ? args.Load3(args_offset + group.x * stride) : uint3(0, 0, 0);
-    }
-    // As the argument clamp bounds a mesh record: the console's mesh
-    // dispatches are one-dimensional, and the record's other two words
-    // are not counts (taken whole, a large one emptied the draw).
-    g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-    DispatchMesh(g.x, g.y, g.z, payload);
-}
-"#;
-    static CODE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
-    CODE.get_or_init(|| {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
         let asked = std::env::var_os("VICTORY_MESH_LAUNCH");
-        if asked.as_ref().is_none_or(|v| v != "1") {
-            tracing::info!(?asked, "mesh launcher stage off (VICTORY_MESH_LAUNCH)");
-            return None;
-        }
-        // The SDK's dxc.exe beside the validator the translator uses.
-        let Some(dxc) = victory_shader::emit::validator::Validator::default_path().map(|p| p.with_file_name("dxc.exe")) else {
-            tracing::warn!("mesh launcher stage: no Windows SDK dxc.exe found");
-            return None;
-        };
-        let dir = std::env::temp_dir().join(format!("victory-launch-{}", std::process::id()));
-        let (hlsl, out) = (dir.join("launch.hlsl"), dir.join("launch.dxil"));
-        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&hlsl, SOURCE)) {
-            tracing::warn!(error = %e, "mesh launcher stage: no room for its source");
-            return None;
-        }
-        let ran = std::process::Command::new(&dxc)
-            .args(["-nologo", "-T", "as_6_5", "-E", "main", "-Fo"])
-            .arg(&out)
-            .arg(&hlsl)
-            .output();
-        if let Ok(o) = &ran
-            && !o.status.success()
-        {
-            tracing::warn!(stderr = %String::from_utf8_lossy(&o.stderr), "mesh launcher stage: dxc failed");
-        }
-        let ok = ran.is_ok_and(|o| o.status.success());
-        let code = ok.then(|| std::fs::read(&out).ok()).flatten();
-        let _ = std::fs::remove_dir_all(&dir);
-        tracing::info!(made = code.is_some(), dxc = %dxc.display(), "mesh launcher stage (VICTORY_MESH_LAUNCH)");
-        code
-    })
-    .as_deref()
+        let on = asked.as_ref().is_some_and(|v| v == "1");
+        tracing::info!(?asked, on, "mesh launcher stage (VICTORY_MESH_LAUNCH)");
+        on
+    });
+    on.then_some(LAUNCH_CODE)
 }
+
+/// [`mesh_launcher`]'s code, built from `launch.hlsl`.
+const LAUNCH_CODE: &[u8] = include_bytes!("launch.dxil");
 
 /// The bytes of shader code (none for an absent stage).
 fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {

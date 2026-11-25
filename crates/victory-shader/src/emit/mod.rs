@@ -169,6 +169,40 @@ pub fn mesh_payload() -> u32 {
     *BYTES.get_or_init(|| if std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| v == "1") { 4 } else { 0 })
 }
 
+/// The payload bytes a mesh shader of `max_vertices` vertices of
+/// `out_rows` output rows and `max_primitives` primitives of `prim_rows`
+/// rows declares: [`mesh_payload`] if its outputs fit 24 KiB
+/// (`VICTORY_LAUNCH_OUT_LIMIT` bytes), else 0, and the host runs it
+/// without its launcher stage. The console's shaders write up to 40 KiB,
+/// past the 32 KiB D3D12 allows; the host card (RTX 3090) draws them
+/// alone, but behind an amplification stage it drew nothing of the ones
+/// over 24 KiB (2026-11-25, the prison cell's walls: limits of 16 and
+/// 24 KiB drew them, 28 and 32 KiB did not; 128 vertices of 12 or 13
+/// rows).
+pub fn mesh_payload_for(max_vertices: u32, max_primitives: u32, out_rows: u32, prim_rows: u32) -> u32 {
+    let bytes = max_vertices * out_rows * 16 + max_primitives * (prim_rows * 16 + 12);
+    if bytes <= mesh_out_limit() { mesh_payload() } else { 0 }
+}
+
+/// Part of the translation, as [`mesh_payload`].
+pub fn mesh_out_limit() -> u32 {
+    static BYTES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_LAUNCH_OUT_LIMIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(24 << 10)
+    })
+}
+
+/// Whether a translated shader (a DXIL container) is a mesh shader that
+/// takes a payload: one the launcher stage may run ahead of.
+pub fn takes_payload(dxil: &[u8]) -> bool {
+    let Some(at) = dxil.windows(4).position(|w| w == b"PSV0") else { return false };
+    let word = |o: usize| dxil.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let info = at + 12;
+    word(at + 8).is_some_and(|size| size >= 28)
+        && dxil.get(info + 24) == Some(&13)
+        && word(info + 8).is_some_and(|p| p > 0)
+}
+
 pub fn group_sync() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {

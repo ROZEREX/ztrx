@@ -188,6 +188,25 @@ fn work_ends_window() -> bool {
     window_mode() == 1
 }
 
+/// Launched indirect mesh calls by mode (1 one record, 2 counted, 3 several
+/// records), the most records and the strides seen: said every ten seconds.
+#[cfg(feature = "diagnostics")]
+fn note_launch(mode: u32, max: u32, stride: u32) {
+    static BY: std::sync::Mutex<Option<(std::time::Instant, [u64; 4], u32, std::collections::BTreeSet<u32>)>> = std::sync::Mutex::new(None);
+    let mut by = BY.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, counts, most, strides) = by.get_or_insert_with(|| (std::time::Instant::now(), [0; 4], 0, Default::default()));
+    counts[mode as usize & 3] += 1;
+    *most = (*most).max(max);
+    strides.insert(stride);
+    if since.elapsed() >= std::time::Duration::from_secs(10) {
+        tracing::info!(single = counts[1], counted = counts[2], several = counts[3], most = *most, ?strides, "launched indirect mesh calls in 10 s");
+        *counts = [0; 4];
+        *most = 0;
+        strides.clear();
+        *since = std::time::Instant::now();
+    }
+}
+
 /// A small buffer bound as the launcher stage's argument buffer for direct
 /// mesh dispatches, which pass their count as a constant and read nothing.
 fn launch_unused_args() -> Option<&'static ID3D12Resource> {
@@ -2520,6 +2539,8 @@ impl State {
                 (_, false) => 3,
             };
             let values = [offset as u32, 0, mode, stride, count_offset, max, 0, 0];
+            #[cfg(feature = "diagnostics")]
+            note_launch(mode, max, stride);
             return self.launch(list, launch, values, &args.buffer, &count_buffer, if mode == 1 { 1 } else { max });
         }
         let counter = match count {

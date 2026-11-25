@@ -154,6 +154,8 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Mesh: the payload bytes it takes (`super::mesh_payload_for`).
+    pub payload: u32,
     /// Geometry (triangles in, triangle strips out on stream 0): its
     /// maximum vertex count. `flag`: writes `SV_Position`.
     pub geometry: Option<u32>,
@@ -204,8 +206,8 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     info[32] = out_vectors as u8;
     if let Some((mesh, shared)) = p.mesh {
         info[0..4].copy_from_slice(&shared.to_le_bytes());
-        // MSInfo.PayloadSizeInBytes (`super::mesh_payload`).
-        info[8..12].copy_from_slice(&super::mesh_payload().to_le_bytes());
+        // MSInfo.PayloadSizeInBytes (`super::mesh_payload_for`).
+        info[8..12].copy_from_slice(&p.payload.to_le_bytes());
         info[12..14].copy_from_slice(&(mesh.max_vertices as u16).to_le_bytes());
         info[14..16].copy_from_slice(&(mesh.max_primitives as u16).to_le_bytes());
         info[26] = vectors(p.prims) as u8;

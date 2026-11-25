@@ -708,12 +708,13 @@ impl Shader {
                 // Mesh state (tag 9): threads, maximum vertices and
                 // primitives, topology, payload bytes.
                 Some(mesh) => {
+                    let payload = self.mesh_payload();
                     props.push(i32c(&mut self, 9));
                     let state = [
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        super::mesh_payload(),
+                        payload,
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
@@ -814,6 +815,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            payload: self.mesh_payload(),
             geometry: self.geometry.map(|g| g.max_vertices),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
@@ -828,6 +830,14 @@ impl Shader {
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
         container::build(&parts)
+    }
+
+    /// The payload bytes this mesh shader declares (`super::mesh_payload_for`).
+    fn mesh_payload(&self) -> u32 {
+        let rows = |els: &[SigElement]| els.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+        self.mesh.map_or(0, |m| {
+            super::mesh_payload_for(m.max_vertices, m.max_primitives, rows(&self.outputs), rows(&self.prims))
+        })
     }
 
     /// The user-data buffer's annotation carries its size, known only now.
