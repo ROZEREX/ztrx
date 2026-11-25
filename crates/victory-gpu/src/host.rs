@@ -5896,7 +5896,28 @@ fn read_fast(src: *const u8, dst: *mut u8, len: usize) -> bool {
     if safe_copy_on() {
         // SAFETY: `dst` is our own writable memory of `len` bytes; a source
         // page that is not there ends the copy early (`safe_copy_fault`).
-        return unsafe { victory_safe_copy(dst, src, len) } == 0;
+        let left = unsafe { victory_safe_copy(dst, src, len) };
+        // (testing, `VICTORY_FAST_READ_CHECK=1`: the kernel's copy of the
+        // same bytes, compared; differences said, the kernel's kept.)
+        static CHECK: OnceLock<bool> = OnceLock::new();
+        if *CHECK.get_or_init(|| std::env::var_os("VICTORY_FAST_READ_CHECK").is_some_and(|v| v == "1")) {
+            let mut kernel = vec![0u8; len];
+            let ok = read(src, kernel.as_mut_ptr(), len);
+            // SAFETY: `dst` holds `len` bytes.
+            let fast = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+            if ok != (left == 0) || (ok && fast != &kernel[..]) {
+                static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 40 {
+                    let first = fast.iter().zip(&kernel).position(|(a, b)| a != b);
+                    tracing::warn!(src = format_args!("{:#x}", src as usize), len, left, kernel_ok = ok, ?first, "fast read differs from the kernel's");
+                }
+                if ok {
+                    fast.copy_from_slice(&kernel);
+                }
+                return ok;
+            }
+        }
+        return left == 0;
     }
     read(src, dst, len)
 }
