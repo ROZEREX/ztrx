@@ -207,6 +207,14 @@ fn note_launch(mode: u32, max: u32, stride: u32) {
     }
 }
 
+/// Whether every launched indirect call waits for earlier compute and copy
+/// writes, as before (`VICTORY_LAUNCH_WAIT_ALL=1`), not only the first
+/// after a compute pass.
+fn launch_waits_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAUNCH_WAIT_ALL").is_some_and(|v| v == "1"))
+}
+
 /// A small buffer bound as the launcher stage's argument buffer for direct
 /// mesh dispatches, which pass their count as a constant and read nothing.
 fn launch_unused_args() -> Option<&'static ID3D12Resource> {
@@ -262,6 +270,13 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// Whether nothing may have written a launched call's record since the
+    /// last wait that makes such writes seen (`before_launch`, or a title
+    /// barrier group, a wait for every write): then the next launched call
+    /// needs no wait of its own. A compute pass of the title's clears it.
+    /// The launcher waited before every call (~3,700 a frame, mostly in
+    /// runs of draws with nothing between them).
+    launch_fenced: bool,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -705,6 +720,7 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.launch_fenced = false;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -938,7 +954,15 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
+    /// A title barrier group was recorded: a wait for every earlier write.
+    pub(crate) fn title_waited(&mut self) {
+        self.launch_fenced = true;
+    }
+
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if compute {
+            self.launch_fenced = false;
+        }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -2532,7 +2556,10 @@ impl State {
                 why("prepare failed");
                 return false;
             }
-            crate::indirect::before_launch(&list.list);
+            if !self.launch_fenced || launch_waits_all() {
+                crate::indirect::before_launch(&list.list);
+                self.launch_fenced = true;
+            }
             let mode = match (max, counter.is_some()) {
                 (1, false) => 1,
                 (_, true) => 2,

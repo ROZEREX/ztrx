@@ -1951,7 +1951,10 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(windows)]
     if count > 0 {
-        with_state(this, |_, state| state.end_window());
+        with_state(this, |_, state| {
+            state.end_window();
+            state.title_waited();
+        });
     }
     #[cfg(windows)]
     if count > 0
