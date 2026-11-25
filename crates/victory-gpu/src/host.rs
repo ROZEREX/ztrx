@@ -1563,6 +1563,24 @@ fn card_back_on() -> bool {
 /// (`VICTORY_CARD_BACK=0`) went from 2.0 to 3.0 fps but drew garbage on
 /// clothes, so some of what is fetched is read elsewhere; this names the
 /// buffers that are not.
+/// Bytes fetched from copies in the card's memory, by title buffer: the
+/// biggest said every ten seconds, to choose `VICTORY_CARD_BACK_SKIP`.
+fn note_fetched(pieces: impl Iterator<Item = ((u64, u64), u64)>) {
+    static BY: Mutex<Option<(std::time::Instant, std::collections::HashMap<(u64, u64), u64>)>> = Mutex::new(None);
+    let mut by = BY.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, map) = by.get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
+    for (span, bytes) in pieces {
+        *map.entry(span).or_insert(0) += bytes;
+    }
+    if since.elapsed() >= std::time::Duration::from_secs(10) {
+        let mut top: Vec<_> = map.drain().collect();
+        top.sort_by_key(|e| std::cmp::Reverse(e.1));
+        let text: Vec<String> = top.iter().take(10).map(|((at, len), b)| format!("{at:#x}+{len:#x}: {:.1} MB", *b as f64 / 1e6)).collect();
+        tracing::info!("fetched from card copies in 10 s, by title buffer: {}", text.join(", "));
+        *since = std::time::Instant::now();
+    }
+}
+
 fn card_back_skipped(shadow: &crate::shadow::Shadow) -> bool {
     static SKIP: OnceLock<Vec<u64>> = OnceLock::new();
     let skip = SKIP.get_or_init(|| {
@@ -1572,7 +1590,18 @@ fn card_back_skipped(shadow: &crate::shadow::Shadow) -> bool {
             .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
             .collect()
     });
-    !skip.is_empty() && skip.contains(&shadow.span().0)
+    // By length too (`VICTORY_CARD_BACK_SKIP_LEN`): the title allocates its
+    // buffers at other addresses from run to run, with the same lengths.
+    static SKIP_LEN: OnceLock<Vec<u64>> = OnceLock::new();
+    let skip_len = SKIP_LEN.get_or_init(|| {
+        std::env::var("VICTORY_CARD_BACK_SKIP_LEN")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    });
+    let (start, len) = shadow.span();
+    skip.contains(&start) || skip_len.contains(&len)
 }
 
 fn wide_merge() -> bool {
@@ -3444,6 +3473,7 @@ impl Host {
             pieces.clear();
         }
         pieces.retain(|(shadow, ..)| !card_back_skipped(shadow));
+        note_fetched(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span(), (hi - lo) as u64)));
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next fetch.
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
