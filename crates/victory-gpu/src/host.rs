@@ -1462,24 +1462,43 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+// A group of 256 threads per piece (the groups laid out as `card_groups`
+// says: 65535 to a row). Each thread hashes every 256th 16-byte step of the
+// piece, so a wave's loads are side by side; the threads' hashes are then
+// folded in a fixed order. The pass took the time of one piece walked 4096
+// steps one after the other by one thread, loads 64 KiB apart in a wave.
+groupshared uint4 part[256];
+uint4 mix(uint4 h, uint4 v) {
+    h = (h ^ v) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return h.yzwx ^ (h >> 15);
+}
 [RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+[numthreads(256, 1, 1)]
+void main(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {
+    uint index = g.y * 65535u + g.x;
+    bool live = index < pieces;
+    uint piece = first + index;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
-    hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    hi = live ? (hi + 15u) & ~15u : lo;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ t;
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+    for (uint at = lo + t * 16u; at < hi; at += 4096u) {
+        h = mix(h, now.Load4(at));
     }
+    part[t] = h;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) part[t] = mix(part[t], part[t + s].zwxy);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (t != 0u || !live) return;
+    h = part[0];
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs.Store(out_at + index * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
         if (compare == 2u) hashes.Store4(piece * 16u, h);
@@ -1488,6 +1507,16 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// Constant views copied on the card ([`Host::card_fills`]) since the last
+/// frame line.
+static CARD_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The groups [`CARD_COMPARE`] is dispatched with for `pieces` pieces: one
+/// per piece, rows of 65535 (the most a dimension takes).
+pub(crate) fn card_groups(pieces: u32) -> (u32, u32) {
+    (pieces.clamp(1, 65535), pieces.div_ceil(65535).max(1))
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -1569,6 +1598,12 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// A constant view's bytes (address, bytes) in a copy in the card's
+    /// memory, copied on the card into memory of ours ahead of the
+    /// submission's lists; the view at the descriptor (CPU handle) is
+    /// pointed there then ([`Host::card_fills`]). Reads no title memory on
+    /// the CPU, so it waits for no flight.
+    CardFill(std::sync::Arc<crate::shadow::Shadow>, usize, u32, usize),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2063,6 +2098,13 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            // Which fills wait for flights: the first few.
+                            static SAID: AtomicU32 = AtomicU32::new(0);
+                            if SAID.fetch_add(1, Ordering::Relaxed) < 40 {
+                                let copy = crate::shadow::find_any(src as u64, 1)
+                                    .map(|s| (s.left(src as u64), std::sync::Arc::strong_count(&s)));
+                                tracing::info!(src = format_args!("{src:#x}"), len, ?copy, "a fill of upload memory waits for flights");
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -2077,7 +2119,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::CardFill(..) => {}
             }
         }
     }
@@ -2957,6 +2999,77 @@ impl Host {
         }
     }
 
+    /// Records, at the end of [`Host::card_before`]'s list (after the CPU
+    /// sides' changes went up), the copies of `fills` (`Step::CardFill`)
+    /// from their copies' card side into memory of ours, 256 bytes apart,
+    /// and points each constant view there. The memory is kept by the
+    /// submission's first list until it is reset.
+    ///
+    /// A copy `dirty` sent bytes to was left in copy-destination state, or
+    /// in shader-resource state if its pieces were hashed again: it goes to
+    /// copy-source state first. Any other is in its common state at the
+    /// list's start and is promoted by the copy.
+    fn card_fills(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        fills: &[(std::sync::Arc<crate::shadow::Shadow>, usize, u32, usize)],
+        dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+        runs: &[&HostList],
+    ) -> windows::core::Result<()> {
+        use std::sync::Arc;
+        let total: u64 = fills.iter().map(|f| u64::from(f.2).next_multiple_of(256)).sum();
+        let Some(dst) = self.uav_buffer(total) else {
+            return Err(windows::core::Error::empty());
+        };
+        name(&dst, || format!("constant views copied on the card {total:#x}"));
+        let mut moved: Vec<(Arc<crate::shadow::Shadow>, D3D12_RESOURCE_STATES)> = Vec::new();
+        for (shadow, ..) in fills {
+            if moved.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                continue;
+            }
+            let Some((_, ranges)) = dirty.iter().find(|(s, _)| Arc::ptr_eq(s, shadow)) else {
+                continue;
+            };
+            if ranges.is_empty() {
+                continue;
+            }
+            let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let state = if hashed { D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE } else { D3D12_RESOURCE_STATE_COPY_DEST };
+            moved.push((shadow.clone(), state));
+        }
+        // SAFETY: an open list; live buffers; the ranges lie in them (the
+        // views were checked against their copy when recorded).
+        unsafe {
+            let to: Vec<D3D12_RESOURCE_BARRIER> =
+                moved.iter().map(|(s, state)| transition(&s.buffer, *state, D3D12_RESOURCE_STATE_COPY_SOURCE)).collect();
+            if !to.is_empty() {
+                list.ResourceBarrier(&to);
+            }
+            let base = dst.GetGPUVirtualAddress();
+            let mut at = 0u64;
+            for (shadow, address, len, handle) in fills {
+                let offset = (*address as u64) - shadow.span().0;
+                list.CopyBufferRegion(&dst, at, &shadow.buffer, offset, u64::from(*len));
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                    BufferLocation: base + at,
+                    SizeInBytes: len.next_multiple_of(256),
+                };
+                self.device.CreateConstantBufferView(Some(&desc), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: *handle });
+                at += u64::from(*len).next_multiple_of(256);
+            }
+            let back: Vec<D3D12_RESOURCE_BARRIER> =
+                moved.iter().map(|(s, state)| transition(&s.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, *state)).collect();
+            if !back.is_empty() {
+                list.ResourceBarrier(&back);
+            }
+        }
+        CARD_FILLS.fetch_add(fills.len() as u64, Ordering::Relaxed);
+        if let Some(first) = runs.first() {
+            first.deferred().kept.push(dst.cast()?);
+        }
+        Ok(())
+    }
+
     /// Before a submission's lists run, for copies in the card's memory
     /// ([`crate::shadow::cards`]): what changed on their CPU side since
     /// the last submission goes to their card side (a list of ours, run
@@ -3002,7 +3115,22 @@ impl Host {
             None => 0,
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
-        if declared.is_empty() && dirty.is_empty() {
+        // Constant views read from copies in the card's memory, copied on
+        // the card after the CPU side's changes went up (`Step::CardFill`).
+        let fills: Vec<(Arc<crate::shadow::Shadow>, usize, u32, usize)> = runs
+            .iter()
+            .flat_map(|list| {
+                list.deferred()
+                    .copies
+                    .iter()
+                    .filter_map(|step| match step {
+                        Step::CardFill(shadow, address, len, handle) => Some((shadow.clone(), *address, *len, *handle)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if declared.is_empty() && dirty.is_empty() && fills.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3023,7 +3151,7 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
-        if !dirty.is_empty() {
+        if !dirty.is_empty() || !fills.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
@@ -3077,8 +3205,12 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            let (x, y) = card_groups(run.pieces);
+                            list.Dispatch(x, y, 1);
                         }
+                    }
+                    if !fills.is_empty() {
+                        self.card_fills(list, &fills, &dirty, runs)?;
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -3162,7 +3294,8 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        let (x, y) = card_groups(r.span.pieces);
+                        list.Dispatch(x, y, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -4874,6 +5007,13 @@ impl HostList {
         deferred.refreshed.clear();
     }
 
+    /// The constant view at descriptor `handle` (CPU handle) gets `len`
+    /// bytes at `address` of `shadow`'s card copy, copied on the card ahead
+    /// of the submission's lists ([`Step::CardFill`]).
+    pub(crate) fn defer_card_fill(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u32, handle: usize) {
+        self.deferred().copies.push(Step::CardFill(shadow.clone(), address as usize, len, handle));
+    }
+
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
@@ -5075,7 +5215,14 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // Textures due, refreshed together (`crate::texture::wide_textures`)
+        // before a step that writes title memory and at the end.
+        let wide_textures = crate::texture::wide_textures();
+        let mut textures: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
         for step in &self.deferred().copies {
+            if !textures.is_empty() && matches!(step, Step::Copy(..) | Step::Run(_)) {
+                crate::texture::refresh_all(&mut textures);
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -5142,9 +5289,14 @@ impl HostList {
                     }
                     continue;
                 }
+                Step::CardFill(..) => continue,
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if wide_textures {
+                            textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -5152,6 +5304,7 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        crate::texture::refresh_all(&mut textures);
     }
 }
 
@@ -5787,6 +5940,10 @@ impl Meter {
                     per_frame(4) / 1e6,
                     per_frame(5),
                     per_frame(6) / 1e3
+                );
+                tracing::info!(
+                    "constant views copied on the card per frame: {:.1} (VICTORY_CARD_FILLS=0: filled from title memory)",
+                    CARD_FILLS.swap(0, Ordering::Relaxed) as f64 / frames
                 );
             }
             tracing::info!(

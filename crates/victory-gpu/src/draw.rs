@@ -141,6 +141,18 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+/// Whether constant views of descriptor tables that lie in a copy in the
+/// card's memory are copied on the card ahead of the lists
+/// (`crate::host::Step::CardFill`) instead of filled from title memory on
+/// the CPU (`VICTORY_CARD_FILLS=0`: filled, as before). A fill reads title
+/// memory, so with flights in the air whose shaders may write the buffer it
+/// waited for them to land: 80-95 ms a frame in gameplay, for 480-byte
+/// constants in the 170 MB buffer (runs "lists1024", "fills").
+fn card_fills() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FILLS").is_some_and(|v| v == "1"))
+}
+
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
@@ -2006,6 +2018,27 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // In a copy in the card's memory, at a 256-byte
+                        // boundary there: read where it is (as a root view
+                        // is), brought up to date in the queue's order. A
+                        // fill from title memory waited for every flight
+                        // whose shaders may write the buffer to land first
+                        // (run "fills": 480-byte constants in the 170 MB
+                        // buffer, one such wait of ~90 ms a frame).
+                        // Any alignment: the card copies the bytes into
+                        // memory of ours ahead of the lists (`CardFill`).
+                        if card_fills()
+                            && size > 0
+                            && size <= 65536
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && shadow.carded()
+                            && shadow.left(address) >= u64::from(size)
+                        {
+                            shadow.refresh(list, address, u64::from(size));
+                            let handle = host.constant_later(index);
+                            list.defer_card_fill(&shadow, address, size, handle);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;

@@ -64,8 +64,9 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    /// The frame a partly mapped texture was last read in.
-    partial: Option<u64>,
+    /// When a partly mapped texture was last read, and how many of its
+    /// kernel pages could be read then.
+    partial: Option<(std::time::Instant, usize)>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -591,6 +592,65 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// How often a partly mapped (still streaming) texture is read again:
+/// `VICTORY_PARTIAL_MS` (100), and then only if more of its pages can be
+/// read (or every two seconds). Reading it whatever changed every 250 ms
+/// cost 500 ms a frame (run "partial"), every second 160 (run "ab_cardmin").
+fn partial_every() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(
+        *MS.get_or_init(|| std::env::var("VICTORY_PARTIAL_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100)),
+    )
+}
+
+/// Whether the textures a list samples are refreshed together on the kept
+/// threads (`crate::shadow::wide`) instead of one after the other on the
+/// submitting thread (`VICTORY_WIDE_TEXTURES=0`: one after the other, as
+/// before).
+///
+/// Each refresh reads title memory, hashes it and detiles it into its own
+/// staging buffer, under its own lock and with a read buffer per thread;
+/// none writes title memory or another texture's staging. While the world
+/// streams in that was 450-2,400 ms a frame on one core of 28 (frame line
+/// "textures"). The submitting thread gathers the due textures and has them
+/// all done before a step that writes title memory and before the list's
+/// steps end, so each texture sees title memory as it did before.
+pub(crate) fn wide_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Refreshes `due` (each a different texture) on the kept threads and this
+/// one, and empties it. The frame line's "textures" time is the time this
+/// thread stood here, not the sum over threads.
+pub(crate) fn refresh_all(due: &mut Vec<Arc<Staging>>) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    match due.len() {
+        0 => return,
+        1 => {
+            due.pop().expect("one").refresh();
+            return;
+        }
+        _ => {}
+    }
+    let started = std::time::Instant::now();
+    let read = Arc::new(AtomicU64::new(0));
+    let jobs: Vec<crate::shadow::Job> = due
+        .drain(..)
+        .map(|staging| {
+            let read = read.clone();
+            Box::new(move || {
+                let n = staging.refresh_now();
+                read.fetch_add(n as u64, Relaxed);
+            }) as crate::shadow::Job
+        })
+        .collect();
+    crate::shadow::wide(jobs);
+    let preparing = &crate::host::PREPARING;
+    preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    preparing[3].fetch_add(read.load(Relaxed), Relaxed);
+}
+
 impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
@@ -680,14 +740,25 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
-            let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
-                return 0;
+            // shortcut: read again at most every `partial_every` (reading
+            // around unmapped pages is slow, and nothing tells us when pages
+            // arrive). It was every 30 frames: at 4 fps a mip that streamed
+            // in showed 7.5 s late, and the world stayed blurry for minutes.
+            // What tells us that pages arrived: the count of its pages that
+            // can be read (one kernel question per 256 pages). Read again
+            // when it changed, at most every `partial_every`; and every two
+            // seconds whatever it says (pages replaced in place).
+            let now = std::time::Instant::now();
+            if let Some((at, pages)) = last.partial {
+                let since = now.duration_since(at);
+                if since < partial_every() {
+                    return 0;
+                }
+                if since < std::time::Duration::from_secs(2) && readable(self.memory as usize, size, false).0 == pages {
+                    return 0;
+                }
             }
-            last.partial = Some(frame);
+            last.partial = Some((now, readable(self.memory as usize, size, false).0));
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {

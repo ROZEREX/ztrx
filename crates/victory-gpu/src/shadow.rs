@@ -961,7 +961,7 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
 }
 
-type Job = Box<dyn FnOnce() + Send>;
+pub(crate) type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
@@ -978,7 +978,13 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // `VICTORY_WIDE_THREADS=<n>`: that many kept threads (texture
+        // refreshes run here too, and a 28-thread CPU left most idle at 6).
+        let n = std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+            .clamp(1, 64);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1002,7 +1008,7 @@ fn workers() -> &'static Workers {
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
-fn wide(jobs: Vec<Job>) {
+pub(crate) fn wide(jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
             job();

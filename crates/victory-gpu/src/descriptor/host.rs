@@ -1212,6 +1212,13 @@ impl HostHeap {
         }
     }
 
+    /// Slot `index` (a dynamic one) is to be a constant buffer view made at
+    /// submission (`crate::host::Step::CardFill`): its CPU handle.
+    pub(crate) fn constant_later(&self, index: u32) -> usize {
+        self.keep(index, None);
+        self.cpu(index).ptr
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
