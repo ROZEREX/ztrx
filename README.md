@@ -47,6 +47,24 @@ keyboard acts as one while the game window has focus.
 `VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
 time on the test machines. Set them in PowerShell before running the script.
 
+### This fork (ROZEREX/ztrx, branch `rozerex-fps`)
+
+Measured in the prologue's prison yard on an i7-14700K + RTX 3090 (64 GB),
+2026-11-25, with `VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=4096
+VICTORY_RELAY=2 VICTORY_WIDE_MERGE=1 VICTORY_WIDE_BACK=1` as the base
+(~2.5 fps):
+
+| Add | What it does | Median fps |
+|---|---|---|
+| `VICTORY_NARROW_WAITS=1` | the indirect-argument clamp waits with enhanced barriers (compute and copies only), not for the whole GPU | ~4.0 |
+| `VICTORY_COPY_FETCH=1` | GPU-written memory is fetched on a copy queue of its own, not behind new work | ~5.3 |
+| `VICTORY_MESH_LAUNCH=1` | an amplification shader reads and bounds each indirect mesh record on the GPU: no compute clamp pass between draws (~5,000 a frame) | ~8.5-9.5 |
+
+With `VICTORY_MESH_LAUNCH`, mesh shaders over 24 KiB of output
+(`VICTORY_LAUNCH_OUT_LIMIT`) keep the clamp: behind an amplification stage
+the RTX 3090 drew nothing of them. The first run after a new build
+translates every shader again; judge the image from the second run.
+
 ## Debugging switches
 
 | Switch | Effect |
