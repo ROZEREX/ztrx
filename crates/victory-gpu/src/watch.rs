@@ -42,6 +42,13 @@ struct Journal {
     /// from the journal, without another kernel call.
     ahead: Vec<(usize, usize)>,
     ahead_asked: u64,
+    /// Page ranges whose last asking failed (memory not write-watched, or
+    /// a range across two reservations): asked again only after the
+    /// title's memory map may have changed ([`refused_again`]). The world
+    /// made ~4,000 such failing askings a frame, the same ranges each
+    /// frame (diagnostics run 2026-11-25), each a kernel call.
+    refused: BTreeSet<(usize, usize)>,
+    refused_since: Option<std::time::Instant>,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
@@ -54,8 +61,29 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
+    refused: BTreeSet::new(),
+    refused_since: None,
     kept: false,
 });
+
+/// Whether the kernel refused `[first, last)` (pages) since the title's
+/// memory map last changed: then it would refuse it again. Forgotten at
+/// every remap of title memory ([`title_memory_remapped`]) and once a
+/// second (an allocation freed and made again is not told here); a range
+/// wrongly held refused is only copied whole or guarded, never missed.
+fn refused_again(j: &mut Journal, first: usize, last: usize) -> bool {
+    if j.refused_since.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+        j.refused.clear();
+        j.refused_since = Some(std::time::Instant::now());
+    }
+    j.refused.contains(&(first, last))
+}
+
+/// Forgets the refused ranges: the title's memory map changed.
+fn forget_refused() {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.refused.clear();
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -191,8 +219,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            let ok = ask_kernel(j, first, last);
+            #[cfg(feature = "diagnostics")]
+            note_ask(if ok { 2 } else { 3 });
+            if ok {
+                j.ahead.push((first, last));
+            }
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -223,6 +256,30 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// Diagnostics: kernel askings by where and how they ended, said every
+/// ten seconds: ahead ok/failed, once-alone ok/failed, `writes` from the
+/// journal, `writes` asked ok, `writes` failed (guarded or none).
+#[cfg(feature = "diagnostics")]
+static ASKS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+#[cfg(feature = "diagnostics")]
+fn note_ask(i: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    ASKS[i].fetch_add(1, Relaxed);
+    let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
+    let at = since.get_or_insert_with(std::time::Instant::now);
+    if at.elapsed() >= std::time::Duration::from_secs(10) {
+        *at = std::time::Instant::now();
+        let n = ASKS.each_ref().map(|a| a.swap(0, Relaxed));
+        tracing::info!(
+            ahead_ok = n[0], ahead_failed = n[1], once_ok = n[2], once_failed = n[3],
+            writes_journal = n[4], writes_ok = n[5], writes_failed = n[6],
+            "write-watch askings in 10 s"
+        );
+    }
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -233,9 +290,13 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(j, first, last) {
+        #[cfg(feature = "diagnostics")]
+        note_ask(0);
         j.ahead.push((first, last));
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    note_ask(1);
     let (a, b) = pieces.split_at(pieces.len() / 2);
     ask_run(j, a);
     ask_run(j, b);
@@ -247,6 +308,9 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    if refused_again(j, first, last) {
+        return false;
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -264,6 +328,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         )
     } != 0;
     if failed {
+        j.refused.insert((first, last));
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -308,6 +373,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        #[cfg(feature = "diagnostics")]
+        note_ask(4);
         return Some((
             j.ahead_asked,
             j.written
@@ -321,17 +388,23 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    let failed = refused_again(j, first, last)
+        // SAFETY: the answer buffer holds `count` entries.
+        || unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+    if failed {
+        j.refused.insert((first, last));
+    }
+    #[cfg(feature = "diagnostics")]
+    note_ask(if failed { 6 } else { 5 });
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -639,6 +712,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // What the kernel refused there may be watched now, and the reverse.
+    forget_refused();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

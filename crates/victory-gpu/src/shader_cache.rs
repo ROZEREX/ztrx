@@ -37,13 +37,20 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// What identifies this build's translations: the BLAKE3 of the
+/// translator's hash (`build.rs`: its sources, the lock file, this file)
+/// and of the translation settings it runs with (the loop limit, which a
+/// diagnostics build can change at run time). It was the executable's
+/// bytes: every build, whatever it changed, translated all shaders again.
+/// `VICTORY_CACHE_BY_EXE=1` keys by the executable, as before.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        let exe = if std::env::var_os("VICTORY_CACHE_BY_EXE").is_some_and(|v| v == "1") {
+            std::env::current_exe().and_then(std::fs::read)
+        } else {
+            Ok(format!("translator {}", env!("VICTORY_TRANSLATOR_HASH")).into_bytes())
+        };
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
