@@ -5888,12 +5888,68 @@ unsafe extern "system" fn safe_copy_fault(info: *mut windows_sys::Win32::System:
     CONTINUE_SEARCH
 }
 
+/// Regions of title memory by start: their end, and whether they are
+/// private memory the plain copy may read ([`fast_region`]). Filled as
+/// reads ask, forgotten where the runtime maps, unmaps or frees.
+static FAST_REGIONS: Mutex<std::collections::BTreeMap<usize, (usize, bool)>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether `[at, at + len)` lies in one region of private, committed
+/// memory: the plain copy reads only there. View memory (`MEM_MAPPED`,
+/// the pool the runtime maps as the world streams) the kernel's copy
+/// refuses, and the refresh has always left it as it was, the card's
+/// writes included; read there, the CPU's older bytes went over the
+/// card's (the cell's walls, 2026-11-25). Asked of Windows once a region.
+fn fast_region(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut regions = FAST_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, &(end, ok))) = regions.range(..=at).next_back()
+        && at < end
+    {
+        return ok && at + len <= end;
+    }
+    // SAFETY: a plain query into a local structure.
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(at as *const _, &mut m, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return false;
+    }
+    let (start, end) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);
+    let ok = m.Type == MEM_PRIVATE && m.State == MEM_COMMIT;
+    if regions.len() > 65536 {
+        regions.clear();
+    }
+    regions.insert(start, (end, ok));
+    ok && at + len <= end
+}
+
+/// The runtime mapped, unmapped or freed title memory `[at, at + len)`:
+/// what [`fast_region`] knew of it is forgotten.
+pub(crate) fn fast_regions_forget(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    let mut regions = FAST_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let gone: Vec<usize> = regions
+        .range(..end)
+        .filter(|&(&start, &(stop, _))| start < end && stop > at)
+        .map(|(&start, _)| start)
+        .collect();
+    for start in gone {
+        regions.remove(&start);
+    }
+}
+
 /// Title guard pages our plain copy touched and put back (`safe_copy_fault`).
 static GUARDS_PUT_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// [`read`] into our own memory: the guarded plain copy, or the kernel's.
 fn read_fast(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    if safe_copy_on() {
+    // Only while the runtime changes no mapping: view memory (the pool the
+    // runtime maps and unmaps as the world streams in) read during a remap
+    // gives another mapping's bytes, where the kernel's copy refuses and
+    // the caller looks again later. That was the cell's walls going
+    // missing with this copy (2026-11-25: 24 reads of view memory the
+    // kernel refused and this copy took). Taken without waiting: while the
+    // runtime remaps, the kernel's copy, as before.
+    let mapped = if safe_copy_on() && fast_region(src as usize, len) { crate::watch::title_memory_reading_now() } else { None };
+    if let Some(_mapped) = mapped {
         // SAFETY: `dst` is our own writable memory of `len` bytes; a source
         // page that is not there ends the copy early (`safe_copy_fault`).
         let left = unsafe { victory_safe_copy(dst, src, len) };
@@ -5905,11 +5961,18 @@ fn read_fast(src: *const u8, dst: *mut u8, len: usize) -> bool {
             let ok = read(src, kernel.as_mut_ptr(), len);
             // SAFETY: `dst` holds `len` bytes.
             let fast = unsafe { std::slice::from_raw_parts_mut(dst, len) };
-            if ok != (left == 0) || (ok && fast != &kernel[..]) {
+            if ok != (left == 0) {
                 static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if SAID.fetch_add(1, Ordering::Relaxed) < 40 {
                     let first = fast.iter().zip(&kernel).position(|(a, b)| a != b);
-                    tracing::warn!(src = format_args!("{:#x}", src as usize), len, left, kernel_ok = ok, ?first, "fast read differs from the kernel's");
+                    let mut m: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    // SAFETY: a plain query into a local structure.
+                    unsafe { windows_sys::Win32::System::Memory::VirtualQuery(src.cast(), &mut m, size_of_val(&m)) };
+                    tracing::warn!(
+                        src = format_args!("{:#x}", src as usize), len, left, kernel_ok = ok, ?first,
+                        kind = format_args!("{:#x}", m.Type), state = format_args!("{:#x}", m.State), protect = format_args!("{:#x}", m.Protect),
+                        "fast read and the kernel's disagree on success"
+                    );
                 }
                 if ok {
                     fast.copy_from_slice(&kernel);

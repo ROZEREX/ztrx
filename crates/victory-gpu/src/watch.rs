@@ -747,6 +747,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     // What the kernel refused there may be watched now, and the reverse.
     forget_refused();
+    // And what the plain copy knew of its regions.
+    crate::host::fast_regions_forget(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
