@@ -97,6 +97,8 @@ footer{margin:64px 0 40px;padding-top:20px;border-top:1px solid var(--line);colo
 
   <h2>Log</h2>
   <div class="log">
+    <div class="card entry"><time>2026-11-25</time><div><h3>Two rebuild attempts that did not pay <span class="pill no">reverted</span></h3>
+      <p><b>Fixer twins:</b> each heavy mesh pipeline got a twin whose amplification stage bounds the record on the drawing pipe, so the card would not switch to compute for every call. The debug layer found nothing wrong, yet the walls drew nothing. The telling part: with those draws missing the frame rate did not move at all, so they were never the bottleneck. <b>Write-watch askings in parallel:</b> preparation got slower (68 → 84 ms); the kernel takes them one at a time anyway. The frame is the CPU's: ~62 ms of work on the submitting thread (38 ms in the kernel), then ~30 ms waiting for the card.</p></div></div>
     <div class="card entry"><time>2026-11-25</time><div><h3>Nsight GPU Trace: the card is waiting, not working <span class="pill fix">measured</span></h3>
       <p>A GPU Trace of steady play: the shader cores do useful work ~3% of the time. The graphics engine has nothing queued ~59% of the frame (it waits for the CPU's preparation), and while it has work it stalls on "wait for idle" a quarter of the cycles: ~10,000 full drains and ~6,700 graphics/compute switches a frame. Half of the switches come from the per-call argument clamp of the heavy mesh shaders. The road to 30 fps is fewer drains and switches on the card, and a lighter CPU side, not faster shaders.</p></div></div>
     <div class="card entry"><time>2026-11-25</time><div><h3>Launcher waits only after compute <span class="pill up">~9.0 → 9.2–9.8 fps</span></h3>
