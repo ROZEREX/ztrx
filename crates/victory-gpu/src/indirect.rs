@@ -502,10 +502,28 @@ fn narrow_waits() -> bool {
     })
 }
 
+/// Whether the clamp recorded into `list` bars its scratch buffer with
+/// enhanced barriers ([`narrow_waits`]): the clamp and [`done_on`] ask the
+/// same question, so the scratch buffer's legacy state is given back
+/// exactly when the clamp gave it one. With `VICTORY_BARRIER_TEST=indirect`
+/// (diagnostics) the clamp keeps its legacy transitions, and a list
+/// without the enhanced interface does too. (Asking `narrow_waits` alone in
+/// `done_on` left the second clamp of a list with the scratch buffer in
+/// `INDIRECT_ARGUMENT` where it expected `COMMON`: found by Artking175 on
+/// an RTX 2060 with both switches set and the debug layer.)
+fn clamp_narrow(list: &ID3D12GraphicsCommandList) -> bool {
+    use windows::core::Interface;
+    #[cfg(feature = "diagnostics")]
+    let waits = crate::copystat::barrier_test() & 2 == 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let waits = true;
+    waits && narrow_waits() && list.cast::<ID3D12GraphicsCommandList7>().is_ok()
+}
+
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
-    // Barred with enhanced barriers only (`narrow_waits`): no state to
+    // Barred with enhanced barriers only (`clamp_narrow`): no state to
     // give back.
-    if narrow_waits() {
+    if clamp_narrow(list) {
         return;
     }
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
