@@ -77,6 +77,10 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Whether shaders were ever given a range of the copy to write
+    /// ([`Shadow::gpu_writes`]): if not, everything in it came from the
+    /// title's CPU, and the copy never left the common state.
+    shader_written: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1726,6 +1730,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            shader_written: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1745,7 +1750,13 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
+    /// Whether shaders were ever given a range of the copy to write.
+    pub(crate) fn shader_written(&self) -> bool {
+        self.shader_written.load(Ordering::Acquire)
+    }
+
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.shader_written.store(true, Ordering::Release);
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer

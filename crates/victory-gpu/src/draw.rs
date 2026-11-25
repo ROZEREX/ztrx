@@ -188,6 +188,17 @@ fn work_ends_window() -> bool {
     window_mode() == 1
 }
 
+/// Whether indirect calls read arguments the title's CPU wrote in place,
+/// unclamped (`VICTORY_DIRECT_ARGS=1`). Every call clamped its record in a
+/// compute pass of its own: on the card the switch from drawing to compute
+/// and back cost ~18 us a call even with narrow waits (timing run
+/// 2026-11-25, ~5,200 calls a frame). The clamp guards against garbage left
+/// by a shader pass we drop; arguments no shader writes cannot hold that.
+fn direct_args() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_ARGS").is_some_and(|v| v == "1"))
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -2449,8 +2460,19 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        // Arguments the title's CPU wrote (no shader was ever given their
+        // copy to write) cannot hold garbage from a pass we dropped: read
+        // where they are, with no clamp pass and no waits around it
+        // (`VICTORY_DIRECT_ARGS=1`). The copy never left the common state,
+        // so the call promotes it to an argument buffer itself.
+        let direct = hit.is_none() && count.is_none() && direct_args() && !args.shader_written();
+        if direct {
+            self.window = None;
+            args.refresh(list, arguments, len);
+        }
         let (bounded, at) = match hit {
             Some(hit) => hit,
+            None if direct => (args.buffer.clone(), offset),
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
@@ -2514,7 +2536,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !direct { crate::indirect::done(list, &bounded); }
             why("prepare failed");
             return false;
         }
@@ -2540,7 +2562,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        if !direct { crate::indirect::done(list, &bounded); }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
