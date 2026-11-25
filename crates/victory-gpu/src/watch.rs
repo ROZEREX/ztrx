@@ -30,6 +30,39 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// (measuring) Time threads waited for a lock another held: the journal
+/// in [`writes`], and a copy's reference in a merge under shader writes;
+/// and how many times. Said every ten seconds.
+static LOCK_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// `m` locked, the wait counted in [`LOCK_WAITS`] place `slot` if it was
+/// held by another.
+pub(crate) fn timed_lock<T>(m: &Mutex<T>, slot: usize) -> std::sync::MutexGuard<'_, T> {
+    use std::sync::atomic::Ordering::Relaxed;
+    match m.try_lock() {
+        Ok(g) => return g,
+        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+    let started = std::time::Instant::now();
+    let g = m.lock().unwrap_or_else(|e| e.into_inner());
+    LOCK_WAITS[slot * 2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    LOCK_WAITS[slot * 2 + 1].fetch_add(1, Relaxed);
+    static SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if let Ok(mut since) = SINCE.try_lock() {
+        let at = since.get_or_insert_with(std::time::Instant::now);
+        if at.elapsed() >= std::time::Duration::from_secs(10) {
+            *at = std::time::Instant::now();
+            let n = LOCK_WAITS.each_ref().map(|a| a.swap(0, Relaxed));
+            tracing::info!(
+                journal_ms = n[0] / 1000, journal_waits = n[1], reference_ms = n[2] / 1000, reference_waits = n[3],
+                "lock waits in 10 s"
+            );
+        }
+    }
+    g
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -369,7 +402,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = timed_lock(&JOURNAL, 0);
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {

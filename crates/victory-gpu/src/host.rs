@@ -2215,6 +2215,43 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
 
+/// (measuring) Where a submission's time goes, by phase, on the thread that
+/// submits: settle at the start, sweep, the write-watch asking and the
+/// check under flights, the lists' deferred steps, the flush of the
+/// refreshes, the copies in the card's memory, the lists to the card, what
+/// is noted after; then, after the submission, the flight's line and the
+/// landing. Said every ten seconds, in milliseconds.
+static PHASE_US: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+struct Phases(std::time::Instant);
+
+impl Phases {
+    fn start() -> Self {
+        Phases(std::time::Instant::now())
+    }
+    fn lap(&mut self, i: usize) {
+        let now = std::time::Instant::now();
+        PHASE_US[i].fetch_add((now - self.0).as_micros() as u64, Ordering::Relaxed);
+        self.0 = now;
+        if i == 10 {
+            static SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+            if let Ok(mut since) = SINCE.try_lock() {
+                let at = since.get_or_insert(now);
+                if at.elapsed() >= std::time::Duration::from_secs(10) {
+                    *at = now;
+                    let n = PHASE_US.each_ref().map(|a| a.swap(0, Ordering::Relaxed) / 1000);
+                    tracing::info!(
+                        enter_settle = n[0], sweep = n[1], ask_and_stale = n[2], deferred = n[3], flush = n[4],
+                        card_before = n[5], to_execute = n[6], execute = n[7], noted = n[8], line = n[9], land = n[10],
+                        title_guards_put_back = GUARDS_PUT_BACK.swap(0, Ordering::Relaxed),
+                        "submission phases in 10 s, ms"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
@@ -3932,6 +3969,7 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        let mut phase = Phases::start();
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
@@ -3962,8 +4000,10 @@ impl Host {
         } else {
             LINE_MOVED.notify_one();
         }
+        phase.lap(9);
         drop(submitted);
         land();
+        phase.lap(10);
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -4160,6 +4200,7 @@ impl Host {
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
+        let mut phase = Phases::start();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
@@ -4181,6 +4222,7 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        phase.lap(0);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -4205,6 +4247,7 @@ impl Host {
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
+        phase.lap(1);
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
@@ -4250,6 +4293,7 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        phase.lap(2);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -4258,6 +4302,7 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        phase.lap(3);
         batch.flush();
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
@@ -4273,6 +4318,7 @@ impl Host {
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
+        phase.lap(4);
         let flown = late && relay();
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
@@ -4280,6 +4326,7 @@ impl Host {
             settled += settling.elapsed();
         }
         let card = self.card_before(runs, flown);
+        phase.lap(5);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -4287,6 +4334,7 @@ impl Host {
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
+            phase.lap(6);
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
@@ -4295,6 +4343,7 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            phase.lap(7);
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -4308,6 +4357,7 @@ impl Host {
                 writes,
             };
             working(was_working);
+            phase.lap(8);
             return Some((submitted, sent));
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
@@ -5654,7 +5704,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = if title_dst { read(src, dst, len) } else { read_fast(src, dst, len) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -5734,7 +5784,121 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    read_fast(src, dst.as_mut_ptr(), dst.len())
+}
+
+// The copy that a missing source page cannot crash ([`safe_copy_on`]):
+// `rep movsb` from `rdx` to `rcx`, `r8` bytes (the Windows x64 calls);
+// returns in `rax` the bytes it did not copy. A fault at the copy
+// instruction is turned by [`safe_copy_fault`] into a jump to the end,
+// with `rcx` the bytes left.
+core::arch::global_asm!(
+    ".globl victory_safe_copy",
+    ".p2align 4",
+    "victory_safe_copy:",
+    "    push rdi",
+    "    push rsi",
+    "    mov rdi, rcx",
+    "    mov rsi, rdx",
+    "    mov rcx, r8",
+    ".globl victory_safe_copy_movs",
+    "victory_safe_copy_movs:",
+    "    rep movsb byte ptr [rdi], byte ptr [rsi]",
+    ".globl victory_safe_copy_done",
+    "victory_safe_copy_done:",
+    "    mov rax, rcx",
+    "    pop rsi",
+    "    pop rdi",
+    "    ret",
+);
+
+unsafe extern "C" {
+    fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    static victory_safe_copy_movs: u8;
+    static victory_safe_copy_done: u8;
+}
+
+/// Whether reads of title memory into our own memory are plain copies,
+/// guarded by an exception handler, instead of the kernel's copy
+/// (`VICTORY_FAST_READ=1`; off by default, see below).
+///
+/// Every read went through `ReadProcessMemory`, a kernel call that
+/// returns an error where a source page is not there: ~15 ms a frame of
+/// the submitting thread for ~120 MB, one kernel entry each. The copy
+/// here runs at the CPU's own speed in user mode. A page that is not
+/// there faults at the copy instruction; the handler sends the copy to
+/// its end with the bytes left counted, and the caller does what it did
+/// when the kernel's copy failed. Writes into title memory keep the
+/// kernel's copy (the guards' handler owns faults there).
+fn safe_copy_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        // Off by default: with it the cell's walls were missing in two runs
+        // of two, present with the kernel's copy (2026-11-25), with no title
+        // guard page touched. The copy is ~15% faster for the submitting
+        // thread, which brings out a race between the refreshes and the
+        // landing of shader writes (the same walls go missing whenever the
+        // CPU side gets ahead: the launcher, the batch).
+        let on = std::env::var_os("VICTORY_FAST_READ").is_some_and(|v| v == "1");
+        if on {
+            use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+            // SAFETY: a handler that only reads and edits the context of a
+            // fault at our own copy instruction.
+            unsafe { AddVectoredExceptionHandler(1, Some(safe_copy_fault)) };
+        }
+        on
+    })
+}
+
+/// The handler for [`safe_copy_on`]: a read fault at our copy instruction
+/// ends the copy there.
+unsafe extern "system" fn safe_copy_fault(info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    const CONTINUE_EXECUTION: i32 = -1;
+    const CONTINUE_SEARCH: i32 = 0;
+    const ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
+    const IN_PAGE_ERROR: i32 = 0xC000_0006_u32 as i32;
+    const GUARD_PAGE: i32 = 0x8000_0001_u32 as i32;
+    // SAFETY: the system passes valid pointers to the fault's record and context.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        let context = &mut *(*info).ContextRecord;
+        let code = record.ExceptionCode;
+        if (code == ACCESS_VIOLATION || code == IN_PAGE_ERROR || code == GUARD_PAGE)
+            && context.Rip == std::ptr::addr_of!(victory_safe_copy_movs) as u64
+        {
+            if code == GUARD_PAGE && record.NumberParameters >= 2 {
+                // The title's own guard page (xmem passes `PAGE_GUARD`
+                // through): touching it took the guard away, and the title
+                // must still find it at its own first touch. It goes back
+                // on; the kernel's copy, which the caller falls back to,
+                // reads past guards without taking them.
+                use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery};
+                let page = (record.ExceptionInformation[1] & !0xfff) as *const core::ffi::c_void;
+                let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                if VirtualQuery(page, &mut m, size_of::<MEMORY_BASIC_INFORMATION>()) != 0 {
+                    let mut old = 0;
+                    VirtualProtect(page, 4096, m.Protect | PAGE_GUARD, &mut old);
+                }
+                GUARDS_PUT_BACK.fetch_add(1, Ordering::Relaxed);
+            }
+            context.Rip = std::ptr::addr_of!(victory_safe_copy_done) as u64;
+            return CONTINUE_EXECUTION;
+        }
+    }
+    CONTINUE_SEARCH
+}
+
+/// Title guard pages our plain copy touched and put back (`safe_copy_fault`).
+static GUARDS_PUT_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`read`] into our own memory: the guarded plain copy, or the kernel's.
+fn read_fast(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if safe_copy_on() {
+        // SAFETY: `dst` is our own writable memory of `len` bytes; a source
+        // page that is not there ends the copy early (`safe_copy_fault`).
+        return unsafe { victory_safe_copy(dst, src, len) } == 0;
+    }
+    read(src, dst, len)
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not

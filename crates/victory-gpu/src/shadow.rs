@@ -2303,7 +2303,7 @@ impl Shadow {
                 // reference under the same lock, and a page read before
                 // such a merge and compared after it would take the card's
                 // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                let mut before = crate::watch::timed_lock(&self.before, 1);
                 // A page that is not there is left as it is, and looked at
                 // again next time.
                 if !crate::host::read_into(lo as *const u8, title) {
